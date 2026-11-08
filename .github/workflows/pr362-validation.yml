@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Verify source parity
         run: |
           git diff --exit-code "$EXPECTED_SOURCE" HEAD -- . ':!.github/workflows/pr362-validation.yml'
-      - name: Build, test and lint with upstream's Swift 6.4.2 image
+      - name: Build and test with upstream's Swift 6.4.2 image
         run: |
           set -euo pipefail
           docker compose run --build --rm -e XTL_CI=1 xtool bash -euo pipefail -c '
@@ -29,11 +29,17 @@ jobs:
             swift build --build-system native --jobs 2 --product xtool
             .build/debug/xtool --help
             swift test --build-system native --jobs 2
-            make lint SWIFTLINT_FLAGS=--strict
             bash -n integration-tests/check-catalyst-sdk.sh
           ' 2>&1 | tee validation.log
+      - name: Lint with compatible system libraries
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/xtool" -w /xtool swift:6.4.2-noble \
+            bash -euo pipefail -c 'make lint SWIFTLINT_FLAGS=--strict' 2>&1 | tee lint.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: pr362-linux-validation
-          path: validation.log
+          path: |
+            validation.log
+            lint.log
