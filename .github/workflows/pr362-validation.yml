@@ -1,0 +1,39 @@
+name: PR 362 Linux validation
+
+on:
+  push:
+    branches: [bvolpato/pr362-validation-20261108]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      EXPECTED_SOURCE: d05c9257eb3fad3a4616cf01f735c32cc33cfb73
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - name: Verify source parity
+        run: |
+          git diff --exit-code "$EXPECTED_SOURCE" HEAD -- . ':!.github/workflows/pr362-validation.yml'
+      - name: Build, test and lint with upstream's Swift 6.4.2 image
+        run: |
+          set -euo pipefail
+          docker compose run --build --rm -e XTL_CI=1 xtool bash -euo pipefail -c '
+            swift --version
+            swift build --build-system native --jobs 2 --product xtool
+            .build/debug/xtool --help
+            swift test --build-system native --jobs 2
+            make lint SWIFTLINT_FLAGS=--strict
+            bash -n integration-tests/check-catalyst-sdk.sh
+          ' 2>&1 | tee validation.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr362-linux-validation
+          path: validation.log
