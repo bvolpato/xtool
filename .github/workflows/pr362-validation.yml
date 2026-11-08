@@ -4,12 +4,18 @@ on:
   push:
     branches: [bvolpato/pr362-validation-20261108]
   workflow_dispatch:
+    inputs:
+      lint_only:
+        description: Run lint on an already built source snapshot
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
-  linux:
+  build-and-test:
+    if: github.event_name != 'workflow_dispatch' || !inputs.lint_only
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -31,15 +37,35 @@ jobs:
             swift test --build-system native --jobs 2
             bash -n integration-tests/check-catalyst-sdk.sh
           ' 2>&1 | tee validation.log
-      - name: Lint with compatible system libraries
-        run: |
-          set -euo pipefail
-          docker run --rm -v "$PWD:/xtool" -w /xtool swift:6.4.2-noble \
-            bash -euo pipefail -c 'make lint SWIFTLINT_FLAGS=--strict' 2>&1 | tee lint.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: pr362-linux-validation
-          path: |
-            validation.log
-            lint.log
+          path: validation.log
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      EXPECTED_SOURCE: d05c9257eb3fad3a4616cf01f735c32cc33cfb73
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify source parity
+        run: |
+          git diff --exit-code "$EXPECTED_SOURCE" HEAD -- . ':!.github/workflows/pr362-validation.yml'
+      - name: Lint with compatible system libraries
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/xtool" -w /xtool swift:6.4.2-noble \
+            bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends ca-certificates make curl unzip
+              export LD_LIBRARY_PATH=/usr/lib:/usr/lib/swift/linux
+              make lint SWIFTLINT_FLAGS=--strict
+            ' 2>&1 | tee lint.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr362-lint-validation
+          path: lint.log
