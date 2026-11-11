@@ -1,0 +1,119 @@
+name: PR 362 native Xcode 27 validation
+
+on:
+  push:
+    branches: [bvolpato/pr362-xcode27-native-20261111]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_SHA: d05c9257eb3fad3a4616cf01f735c32cc33cfb73
+  XTL_CI: "1"
+
+jobs:
+  native:
+    name: Native ${{ matrix.target }} with Xcode 27.1
+    runs-on: xcode-27
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [macos, ios]
+    steps:
+      - name: Check out the exact PR source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source and select Xcode 27.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git diff --exit-code
+          xtool_xcode_app=/Applications/Xcode_27.1.app
+          if [[ ! -d "$xtool_xcode_app" ]]; then
+            xtool_xcode_app=/Applications/Xcode_27.1.0.app
+          fi
+          test -d "$xtool_xcode_app/Contents/Developer"
+          export DEVELOPER_DIR="$xtool_xcode_app/Contents/Developer"
+          xcodebuild -version | tee "$RUNNER_TEMP/xcode-version.log"
+          grep -qx 'Xcode 27.1' "$RUNNER_TEMP/xcode-version.log"
+          xcrun --sdk iphoneos --show-sdk-version | tee "$RUNNER_TEMP/iphoneos-sdk-version.log"
+          xcrun swift --version | tee "$RUNNER_TEMP/swift-version.log"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "XTL_TEST_XCODE_APP=$xtool_xcode_app" >> "$GITHUB_ENV"
+          jq -n \
+            --arg sourceCommit "$SOURCE_SHA" \
+            --arg workflowCommit "$GITHUB_SHA" \
+            --arg target '${{ matrix.target }}' \
+            --arg xcode "$(cat "$RUNNER_TEMP/xcode-version.log")" \
+            --arg swift "$(cat "$RUNNER_TEMP/swift-version.log")" \
+            --arg sdk "$(xcrun --sdk iphoneos --show-sdk-version)" \
+            '{sourceCommit:$sourceCommit,workflowCommit:$workflowCommit,target:$target,xcode:$xcode,swift:$swift,iPhoneOSSDK:$sdk}' \
+            > "$RUNNER_TEMP/native-provenance.json"
+
+      - name: Build the native macOS CLI and check help
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swift build --jobs 2 --product xtool 2>&1 | tee "$RUNNER_TEMP/macos-build.log"
+          .build/debug/xtool --help 2>&1 | tee "$RUNNER_TEMP/macos-help.log"
+          shasum -a 256 .build/debug/xtool | tee "$RUNNER_TEMP/macos-binary.sha256"
+
+      - name: Run native Swift tests including Xcode-dependent cases
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swift test --jobs 2 2>&1 | tee "$RUNNER_TEMP/macos-tests.log"
+
+      - name: Run the repository's pinned SwiftLint
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make lint SWIFTLINT_FLAGS=--strict 2>&1 | tee "$RUNNER_TEMP/swiftlint.log"
+
+      - name: Build unsigned XKit for iOS
+        if: matrix.target == 'ios'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -skipMacroValidation -skipPackagePluginValidation \
+            -scheme XKit -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$RUNNER_TEMP/ios-xkit-build.log"
+
+      - name: Verify tracked source stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git diff --exit-code
+
+      - name: Keep native validation logs and provenance
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr362-xcode27-native-${{ matrix.target }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/native-provenance.json
+            ${{ runner.temp }}/xcode-version.log
+            ${{ runner.temp }}/swift-version.log
+            ${{ runner.temp }}/iphoneos-sdk-version.log
+            ${{ runner.temp }}/macos-*.log
+            ${{ runner.temp }}/macos-binary.sha256
+            ${{ runner.temp }}/swiftlint.log
+            ${{ runner.temp }}/ios-xkit-build.log
