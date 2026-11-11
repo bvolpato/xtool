@@ -1,0 +1,43 @@
+name: Verify recorded RCodesign native comparison
+
+on:
+  push:
+    branches: [bvolpato/rcodesign-recorded-comparison-20261111]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  compare:
+    name: Compare immutable Xcode 26.6 native evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the comparison script
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download and verify the recorded archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/bvolpato/xtool/actions/artifacts/13864734802/zip > baseline.zip
+          gh api repos/bvolpato/xtool/actions/artifacts/13864304704/zip > candidate.zip
+          printf '%s  %s\n' 5aa66096d04e90778e3a405e4f670dfe268e6dd27d0056e25fb92f79673e7cfa baseline.zip | sha256sum -c -
+          printf '%s  %s\n' c47bba3527bb2a6ef7a31052b82bbab0bb129b6b2ac70b11fb05190062fd812c candidate.zip | sha256sum -c -
+          unzip -q baseline.zip -d baseline
+          unzip -q candidate.zip -d candidate
+
+      - name: Verify provenance, actual dependency graphs, and native outcomes
+        run: node .github/scripts/verify-recorded-rcodesign.mjs baseline candidate recorded-comparison.json
+
+      - name: Keep the comparison result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rcodesign-recorded-native-comparison
+          retention-days: 14
+          path: recorded-comparison.json
