@@ -1,0 +1,127 @@
+name: RCodesign matched remote product validation
+
+on:
+  push:
+    branches: [bvolpato/pr362-rcodesign-remote-20261111]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_SHA: d05c9257eb3fad3a4616cf01f735c32cc33cfb73
+  XTL_CI: "1"
+
+jobs:
+  ios:
+    name: Remote ${{ matrix.variant }} with Xcode 26.6
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            rcodesignSHA: 08650ab9d3bf95a0c585581b8bd63eb7b8315264
+          - variant: candidate
+            rcodesignSHA: 3f4022aa98b7eaa33d88300c6185ddc06a664434
+    env:
+      RCODESIGN_SHA: ${{ matrix.rcodesignSHA }}
+    steps:
+      - name: Check out the exact consumer source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source and select Xcode 26.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git diff --exit-code
+          xtool_xcode_app=/Applications/Xcode_26.6.app
+          if [[ ! -d "$xtool_xcode_app" ]]; then
+            xtool_xcode_app=/Applications/Xcode_26.6.0.app
+          fi
+          test -d "$xtool_xcode_app/Contents/Developer"
+          export DEVELOPER_DIR="$xtool_xcode_app/Contents/Developer"
+          xcodebuild -version | tee "$RUNNER_TEMP/xcode-version.log"
+          grep -qx 'Xcode 26.6' "$RUNNER_TEMP/xcode-version.log"
+          xcrun --sdk iphoneos --show-sdk-version | tee "$RUNNER_TEMP/iphoneos-sdk-version.log"
+          xcrun swift --version | tee "$RUNNER_TEMP/swift-version.log"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "XTL_TEST_XCODE_APP=$xtool_xcode_app" >> "$GITHUB_ENV"
+          jq -n \
+            --arg sourceCommit "$SOURCE_SHA" \
+            --arg workflowCommit "$GITHUB_SHA" \
+            --arg rcodesignCommit "$RCODESIGN_SHA" \
+            --arg variant '${{ matrix.variant }}' \
+            --arg xcode "$(cat "$RUNNER_TEMP/xcode-version.log")" \
+            --arg swift "$(cat "$RUNNER_TEMP/swift-version.log")" \
+            --arg sdk "$(cat "$RUNNER_TEMP/iphoneos-sdk-version.log")" \
+            '{sourceCommit:$sourceCommit,workflowCommit:$workflowCommit,rcodesignCommit:$rcodesignCommit,variant:$variant,xcode:$xcode,swift:$swift,iPhoneOSSDK:$sdk}' \
+            > "$RUNNER_TEMP/native-provenance.json"
+
+      - name: Select the exact remote dependency for this experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp Package.resolved "$RUNNER_TEMP/original-package-resolved.json"
+          ruby <<'RUBY'
+          path = "Package.swift"
+          source = File.read(path)
+          original = '.package(url: "https://github.com/xtool-org/swift-rcodesign", .upToNextMinor(from: "0.2.0"))'
+          abort "Unexpected dependency declaration" unless source.scan(original).length == 1
+          replacement = ".package(url: \"https://github.com/bvolpato/swift-rcodesign\", revision: \"#{ENV.fetch('RCODESIGN_SHA')}\")"
+          File.write(path, source.sub(original, replacement))
+          RUBY
+          cp Package.swift "$RUNNER_TEMP/expected-package.swift"
+          git diff -- Package.swift | tee "$RUNNER_TEMP/consumer-remote-override.patch"
+
+      - name: Build unsigned XKit for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -skipMacroValidation -skipPackagePluginValidation \
+            -scheme XKit -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$RUNNER_TEMP/ios-xkit-build.log"
+
+      - name: Verify the dependency and every other resolved pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cmp Package.swift "$RUNNER_TEMP/expected-package.swift"
+          git diff --exit-code -- . ':!Package.swift' ':!Package.resolved'
+          jq -e --arg expected "$RCODESIGN_SHA" \
+            '.pins[] | select(.identity == "swift-rcodesign") | .state.revision == $expected and .location == "https://github.com/bvolpato/swift-rcodesign"' \
+            Package.resolved
+          jq '.pins | map(select(.identity != "swift-rcodesign")) | sort_by(.identity)' \
+            "$RUNNER_TEMP/original-package-resolved.json" > "$RUNNER_TEMP/original-pins.json"
+          jq '.pins | map(select(.identity != "swift-rcodesign")) | sort_by(.identity)' \
+            Package.resolved > "$RUNNER_TEMP/current-pins.json"
+          diff -u "$RUNNER_TEMP/original-pins.json" "$RUNNER_TEMP/current-pins.json"
+
+      - name: Keep the matched experiment logs and provenance
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr362-rcodesign-remote-${{ matrix.variant }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/native-provenance.json
+            ${{ runner.temp }}/xcode-version.log
+            ${{ runner.temp }}/swift-version.log
+            ${{ runner.temp }}/iphoneos-sdk-version.log
+            ${{ runner.temp }}/consumer-remote-override.patch
+            ${{ runner.temp }}/original-package-resolved.json
+            ${{ runner.temp }}/ios-xkit-build.log
+            Package.resolved
