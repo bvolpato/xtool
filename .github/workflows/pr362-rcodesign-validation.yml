@@ -1,0 +1,168 @@
+name: RCodesign native product visibility validation
+
+on:
+  push:
+    branches: [bvolpato/pr362-rcodesign-validation-20261111]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_SHA: d05c9257eb3fad3a4616cf01f735c32cc33cfb73
+  RCODESIGN_SHA: 3f4022aa98b7eaa33d88300c6185ddc06a664434
+  XTL_CI: "1"
+
+jobs:
+  native:
+    name: Candidate ${{ matrix.target }} with Xcode 26.6
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [macos, ios]
+    steps:
+      - name: Check out the exact PR source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the product-only RCodesign candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: bvolpato/swift-rcodesign
+          ref: ${{ env.RCODESIGN_SHA }}
+          path: .validation/swift-rcodesign
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source and select Xcode 26.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git diff --exit-code
+          test "$(git -C .validation/swift-rcodesign rev-parse HEAD)" = "$RCODESIGN_SHA"
+          git -C .validation/swift-rcodesign diff --exit-code
+          test "$(git -C .validation/swift-rcodesign rev-parse HEAD^)" = 08650ab9d3bf95a0c585581b8bd63eb7b8315264
+          git -C .validation/swift-rcodesign diff HEAD^ HEAD -- Package.swift | tee "$RUNNER_TEMP/rcodesign-product.patch"
+          xtool_xcode_app=/Applications/Xcode_26.6.app
+          if [[ ! -d "$xtool_xcode_app" ]]; then
+            xtool_xcode_app=/Applications/Xcode_26.6.0.app
+          fi
+          test -d "$xtool_xcode_app/Contents/Developer"
+          export DEVELOPER_DIR="$xtool_xcode_app/Contents/Developer"
+          xcodebuild -version | tee "$RUNNER_TEMP/xcode-version.log"
+          grep -qx 'Xcode 26.6' "$RUNNER_TEMP/xcode-version.log"
+          xcrun --sdk iphoneos --show-sdk-version | tee "$RUNNER_TEMP/iphoneos-sdk-version.log"
+          xcrun swift --version | tee "$RUNNER_TEMP/swift-version.log"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "XTL_TEST_XCODE_APP=$xtool_xcode_app" >> "$GITHUB_ENV"
+          jq -n \
+            --arg sourceCommit "$SOURCE_SHA" \
+            --arg workflowCommit "$GITHUB_SHA" \
+            --arg rcodesignCommit "$RCODESIGN_SHA" \
+            --arg rcodesignBase "08650ab9d3bf95a0c585581b8bd63eb7b8315264" \
+            --arg target '${{ matrix.target }}' \
+            --arg xcode "$(cat "$RUNNER_TEMP/xcode-version.log")" \
+            --arg swift "$(cat "$RUNNER_TEMP/swift-version.log")" \
+            --arg sdk "$(xcrun --sdk iphoneos --show-sdk-version)" \
+            '{sourceCommit:$sourceCommit,workflowCommit:$workflowCommit,target:$target,rcodesignCommit:$rcodesignCommit,rcodesignBase:$rcodesignBase,xcode:$xcode,swift:$swift,iPhoneOSSDK:$sdk}' \
+            > "$RUNNER_TEMP/native-provenance.json"
+
+      - name: Use the candidate only for this validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp Package.resolved "$RUNNER_TEMP/original-package-resolved.json"
+          ruby <<'RUBY'
+          path = "Package.swift"
+          source = File.read(path)
+          original = '.package(url: "https://github.com/xtool-org/swift-rcodesign", .upToNextMinor(from: "0.2.0"))'
+          abort "Unexpected dependency declaration" unless source.scan(original).length == 1
+          File.write(path, source.sub(original, '.package(path: ".validation/swift-rcodesign")'))
+          RUBY
+          cp Package.swift "$RUNNER_TEMP/expected-package.swift"
+          git diff -- Package.swift | tee "$RUNNER_TEMP/consumer-local-override.patch"
+
+      - name: Test the RCodesign candidate on macOS
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swift test --package-path .validation/swift-rcodesign --jobs 2 \
+            2>&1 | tee "$RUNNER_TEMP/rcodesign-macos-tests.log"
+
+      - name: Build the native macOS CLI and check help
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swift build --jobs 2 --product xtool 2>&1 | tee "$RUNNER_TEMP/macos-build.log"
+          .build/debug/xtool --help 2>&1 | tee "$RUNNER_TEMP/macos-help.log"
+          shasum -a 256 .build/debug/xtool | tee "$RUNNER_TEMP/macos-binary.sha256"
+
+      - name: Run native Swift tests including Xcode-dependent cases
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swift test --jobs 2 2>&1 | tee "$RUNNER_TEMP/macos-tests.log"
+
+      - name: Run the repository's pinned SwiftLint
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make lint SWIFTLINT_FLAGS=--strict 2>&1 | tee "$RUNNER_TEMP/swiftlint.log"
+
+      - name: Build unsigned XKit for iOS
+        if: matrix.target == 'ios'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -skipMacroValidation -skipPackagePluginValidation \
+            -scheme XKit -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$RUNNER_TEMP/ios-xkit-build.log"
+
+      - name: Verify only the declared dependency override changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cmp Package.swift "$RUNNER_TEMP/expected-package.swift"
+          git diff --exit-code -- . ':!Package.swift' ':!Package.resolved'
+          jq '.pins | map(select(.identity != "swift-rcodesign")) | sort_by(.identity)' \
+            "$RUNNER_TEMP/original-package-resolved.json" > "$RUNNER_TEMP/original-pins.json"
+          jq '.pins | map(select(.identity != "swift-rcodesign")) | sort_by(.identity)' \
+            Package.resolved > "$RUNNER_TEMP/current-pins.json"
+          diff -u "$RUNNER_TEMP/original-pins.json" "$RUNNER_TEMP/current-pins.json"
+          git -C .validation/swift-rcodesign diff --exit-code
+
+      - name: Keep native validation logs and provenance
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr362-rcodesign-${{ matrix.target }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/native-provenance.json
+            ${{ runner.temp }}/xcode-version.log
+            ${{ runner.temp }}/swift-version.log
+            ${{ runner.temp }}/iphoneos-sdk-version.log
+            ${{ runner.temp }}/macos-*.log
+            ${{ runner.temp }}/macos-binary.sha256
+            ${{ runner.temp }}/swiftlint.log
+            ${{ runner.temp }}/ios-xkit-build.log
+            ${{ runner.temp }}/rcodesign-product.patch
+            ${{ runner.temp }}/consumer-local-override.patch
+            ${{ runner.temp }}/rcodesign-macos-tests.log
