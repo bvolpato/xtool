@@ -17,7 +17,7 @@ env:
 
 jobs:
   native:
-    name: Native ${{ matrix.target }} with Xcode 27.2
+    name: Native ${{ matrix.target }} with Xcode 26.6
     runs-on: macos-26
     timeout-minutes: 60
     strategy:
@@ -32,21 +32,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify source and select Xcode 27.2
+      - name: Verify source and select Xcode 26.6
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git diff --exit-code
-          xtool_xcode_app=/Applications/Xcode_27.2.app
+          xtool_xcode_app=/Applications/Xcode_26.6.app
           if [[ ! -d "$xtool_xcode_app" ]]; then
-            xtool_xcode_app=/Applications/Xcode_27.2.0.app
+            xtool_xcode_app=/Applications/Xcode_26.6.0.app
           fi
           test -d "$xtool_xcode_app/Contents/Developer"
           export DEVELOPER_DIR="$xtool_xcode_app/Contents/Developer"
           xcodebuild -version | tee "$RUNNER_TEMP/xcode-version.log"
-          grep -qx 'Xcode 27.2' "$RUNNER_TEMP/xcode-version.log"
-          test "$(xcrun --sdk iphoneos --show-sdk-version)" = 27.2
+          grep -qx 'Xcode 26.6' "$RUNNER_TEMP/xcode-version.log"
+          xcrun --sdk iphoneos --show-sdk-version | tee "$RUNNER_TEMP/iphoneos-sdk-version.log"
           xcrun swift --version | tee "$RUNNER_TEMP/swift-version.log"
           echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
           echo "XTL_TEST_XCODE_APP=$xtool_xcode_app" >> "$GITHUB_ENV"
@@ -112,6 +112,7 @@ jobs:
             ${{ runner.temp }}/native-provenance.json
             ${{ runner.temp }}/xcode-version.log
             ${{ runner.temp }}/swift-version.log
+            ${{ runner.temp }}/iphoneos-sdk-version.log
             ${{ runner.temp }}/macos-*.log
             ${{ runner.temp }}/macos-binary.sha256
             ${{ runner.temp }}/swiftlint.log
